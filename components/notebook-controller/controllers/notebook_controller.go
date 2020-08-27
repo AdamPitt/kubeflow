@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -110,6 +111,13 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
 		log.Error(err, "unable to fetch Notebook")
 		return ctrl.Result{}, ignoreNotFound(err)
+	}
+
+	if os.Getenv("ENABLE_SPARK_DRIVER") == "true" {
+		err := r.reconcileGRCustomSparkDriverService(instance)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Reconcile StatefulSet
@@ -222,6 +230,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			}
 			err = r.Status().Update(ctx, instance)
 			if err != nil {
+				log.Error(err, "Unable to update instance", "instance", instance)
 				return ctrl.Result{}, err
 			}
 		}
@@ -501,6 +510,178 @@ func nbNameExists(client client.Client, nbName string, namespace string) bool {
 		return !apierrs.IsNotFound(err)
 	}
 	return true
+}
+
+func (r *NotebookReconciler) reconcileGRCustomSparkDriverService(instance *v1beta1.Notebook) error {
+	log := r.Log.WithValues("notebook", instance.Namespace)
+	var p1 int32 = 1
+	var p2 int32 = 2
+	var p3 int32 = 3
+
+	// Reconcile service
+	service := generateBlankSparkDriverService(instance)
+	if err := ctrl.SetControllerReference(instance, service, r.Scheme); err != nil {
+		return err
+	}
+
+	// Check if the Service already exists
+	foundService := &corev1.Service{}
+	justCreated := false
+	err := r.Get(context.TODO(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, foundService)
+	if err != nil && apierrs.IsNotFound(err) {
+		log.Info("Creating Service", "namespace", service.Namespace, "name", service.Name)
+		err = r.Create(context.TODO(), service)
+		justCreated = true
+		if err != nil {
+			log.Error(err, "unable to create Service")
+			return err
+		}
+	} else if err != nil {
+		log.Error(err, "error getting Statefulset")
+		return err
+	} else {
+
+		// Find the assigned NodePorts if the service exists
+		if len(foundService.Spec.Ports) >= 3 {
+			p1 = foundService.Spec.Ports[0].NodePort
+			p2 = foundService.Spec.Ports[1].NodePort
+			p3 = foundService.Spec.Ports[2].NodePort
+			log.Info("p1:" + strconv.Itoa(int(p1)) + " p2:" + strconv.Itoa(int(p2)) + " p3:" + strconv.Itoa(int(p3)))
+		}
+
+		// Regenerate the desired Service with the additional NodePorts
+		service = generateSparkDriverService(instance, p1, p2, p3)
+		if err := ctrl.SetControllerReference(instance, service, r.Scheme); err != nil {
+			return err
+		}
+
+		// Update Notebook Spec to include ports as environment variables
+		err = injectPortsIntoNotebook(instance, p1, p2, p3)
+		if err != nil {
+			log.Error(err, "error injecting ports into Notebook Env")
+			return err
+		}
+
+	}
+
+	// Update the foundService object and write the result back if there are any changes
+	if !justCreated && reconcilehelper.CopyServiceFields(service, foundService) {
+		log.Info("Updating Service\n", "namespace", service.Namespace, "name", service.Name)
+		err = r.Update(context.TODO(), foundService)
+		if err != nil {
+			log.Error(err, "unable to update Service")
+			return err
+		}
+		log.Info("3", "%+v\n", foundService.Spec.Ports)
+	}
+
+	return nil
+}
+
+func generateBlankSparkDriverService(instance *v1beta1.Notebook) *corev1.Service {
+	// Define the desired Service object
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "spark-" + instance.Name,
+			Namespace: instance.Namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Type:     "NodePort",
+			Selector: map[string]string{"statefulset": instance.Name},
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "rpc-" + instance.Name,
+					Port:       1,
+					TargetPort: intstr.FromInt(1),
+					Protocol:   "TCP",
+				},
+				{
+					Name:       "blockmanager-" + instance.Name,
+					Port:       2,
+					TargetPort: intstr.FromInt(2),
+					Protocol:   "TCP",
+				},
+				{
+					Name:       "ui-" + instance.Name,
+					Port:       3,
+					TargetPort: intstr.FromInt(3),
+					Protocol:   "TCP",
+				},
+			},
+		},
+	}
+	return svc
+}
+
+func generateSparkDriverService(instance *v1beta1.Notebook, p1 int32, p2 int32, p3 int32) *corev1.Service {
+	// Define the desired Service object
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "spark-" + instance.Name,
+			Namespace: instance.Namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Type:     "NodePort",
+			Selector: map[string]string{"statefulset": instance.Name},
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "rpc-" + instance.Name,
+					Port:       p1,
+					TargetPort: intstr.FromInt(int(p1)),
+					Protocol:   "TCP",
+					NodePort:   p1,
+				},
+				{
+					Name:       "blockmanager-" + instance.Name,
+					Port:       p2,
+					TargetPort: intstr.FromInt(int(p2)),
+					Protocol:   "TCP",
+					NodePort:   p2,
+				},
+				{
+					Name:       "ui-" + instance.Name,
+					Port:       p3,
+					TargetPort: intstr.FromInt(int(p3)),
+					Protocol:   "TCP",
+					NodePort:   p3,
+				},
+			},
+		},
+	}
+	return svc
+}
+
+func injectPortsIntoNotebook(instance *v1beta1.Notebook, p1 int32, p2 int32, p3 int32) error {
+	for i, c := range instance.Spec.Template.Spec.Containers {
+		if strings.Contains(c.Image, "polynote") {
+			newEnv := []corev1.EnvVar{}
+			for _, e := range c.Env {
+				var exists = false
+				for _, s := range []string{"DRIVER_PORT", "BLOCKMANAGER_PORT", "UI_PORT"} {
+					if e.Name == s {
+						exists = true
+					}
+				}
+				if !exists {
+					newEnv = append(newEnv, e)
+				}
+			}
+			newEnv = append(newEnv, corev1.EnvVar{
+				Name:  "DRIVER_PORT",
+				Value: strconv.Itoa(int(p1)),
+			})
+			newEnv = append(newEnv, corev1.EnvVar{
+				Name:  "BLOCKMANAGER_PORT",
+				Value: strconv.Itoa(int(p2)),
+			})
+			newEnv = append(newEnv, corev1.EnvVar{
+				Name:  "UI_PORT",
+				Value: strconv.Itoa(int(p3)),
+			})
+			instance.Spec.Template.Spec.Containers[i].Env = newEnv
+		}
+	}
+	return nil
 }
 
 func (r *NotebookReconciler) SetupWithManager(mgr ctrl.Manager) error {
